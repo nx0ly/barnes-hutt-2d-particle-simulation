@@ -1,10 +1,82 @@
 // who thought it would be a good idea to base all the quadtree
 // code for f32????!?!?!?!?!?
 
+use std::cell::RefCell;
+
 use quadtree::{BHQuadtree, Vec2, WeightedPoint};
 use rand::Rng;
 use rayon::prelude::*;
 use three_d::*;
+use wide::f32x4;
+
+// some wide-related functions
+// uses more modern cpu calls to process stuff in batches
+// i will NOT be using the gpu in ANY scenario (CUDA PTSD)
+fn accumulate_batch(target: Vec2, points: &[WeightedPoint]) -> Vec2 {
+    let mut acc_x = 0.0;
+    let mut acc_y = 0.0;
+
+    for chunk in points.chunks_exact(4) {
+        let px = f32x4::from([chunk[0].pos.x, chunk[1].pos.x, chunk[2].pos.x, chunk[3].pos.x]);
+        let py = f32x4::from([chunk[0].pos.y, chunk[1].pos.y, chunk[2].pos.y, chunk[3].pos.y]);
+        let m  = f32x4::from([chunk[0].mass,  chunk[1].mass,  chunk[2].mass,  chunk[3].mass]);
+
+        let tx = f32x4::splat(target.x);
+        let ty = f32x4::splat(target.y);
+
+        let dx = px - tx;
+        let dy = py - ty;
+
+        let dist_sq = dx * dx + dy * dy + f32x4::splat(0.5);
+
+        let inv_dist_sq = f32x4::ONE / dist_sq;
+        let inv_dist = inv_dist_sq.sqrt();
+        let strength = m * inv_dist_sq;
+
+        let fx = dx * strength * inv_dist;
+        let fy = dy * strength * inv_dist;
+
+        acc_x += fx.reduce_add();
+        acc_y += fy.reduce_add();
+    }
+
+    for wp in points.chunks_exact(4).remainder() {
+        let dir = wp.pos - target;
+        let dist_sq = dir.length_squared() + 0.5;
+        let inv_dist_sq = 1.0 / dist_sq;
+        let inv_dist = inv_dist_sq.sqrt();
+        let strength = wp.mass * inv_dist_sq;
+        acc_x += dir.x * strength * inv_dist;
+        acc_y += dir.y * strength * inv_dist;
+    }
+
+    Vec2::new(acc_x, acc_y)
+}
+
+fn accumulate_simd(quad: &quadtree::BHQuadtree, target: Vec2) -> Vec2 {
+    let buffer = RefCell::new(Vec::with_capacity(32));
+    let total = RefCell::new(Vec2::ZERO);
+
+    quad.accumulate(target, |wp: WeightedPoint| {
+        let mut buf = buffer.borrow_mut();
+        buf.push(wp);
+
+        if buf.len() >= 4 {
+            let force = accumulate_batch(target, &buf);
+            *total.borrow_mut() += force;
+            buf.clear();
+        }
+
+        Vec2::ZERO // must return something, but ignored
+    });
+
+    let buf = buffer.into_inner();
+    if !buf.is_empty() {
+        *total.borrow_mut() += accumulate_batch(target, &buf);
+    }
+
+    total.into_inner()
+}
 
 #[derive(Clone)]
 struct Particle {
@@ -52,7 +124,7 @@ struct Simulation {
 impl Simulation {
     pub fn new() -> Self {
         Self {
-            bh_quad: BHQuadtree::new(1.5),
+            bh_quad: BHQuadtree::new(0.85),
             particles: Vec::new(),
             weighted_buff: Vec::new(),
             bound_min: Vec2::ZERO,
@@ -116,13 +188,13 @@ impl Simulation {
 
         self.weighted_buff.clear();
         self.weighted_buff
-            .extend(self.particles.iter().map(|p| WeightedPoint {
+            .par_extend(self.particles.par_iter().map(|p| WeightedPoint {
                 pos: p.pos,
                 mass: p.mass,
             }));
 
         self.bh_quad
-            .build(std::mem::take(&mut self.weighted_buff), 6);
+            .build(std::mem::take(&mut self.weighted_buff), 24);
 
         self.particles.par_iter_mut().for_each(|p| {
             // ignore particles certain distance away
@@ -132,28 +204,34 @@ impl Simulation {
             //}
             let target = p.pos;
 
-            let total_force: Vec2 = self.bh_quad.accumulate(target, |wp: WeightedPoint| {
+            /*let total_force: Vec2 = self.bh_quad.accumulate(target, |wp: WeightedPoint| {
                 if wp.pos == target {
                     return Vec2::ZERO;
                 }
 
                 let dir = wp.pos - target;
-                let dist_sq = dir.length_squared() + 20.;
+                let mut dist_sq = dir.length_squared() + 0.5;
 
-                if dist_sq > 25000. {
-                    return Vec2::ZERO;
-                }
+                //if dist_sq < f32::MIN_POSITIVE {
+                //    dist_sq = f32::MIN_POSITIVE;
+                //}
+
+                //if dist_sq > 25000. {
+                //    return Vec2::ZERO;
+                //}
 
                 let inv_dist_sq = 1.0 / dist_sq;
                 let inv_dist = inv_dist_sq.sqrt();
                 let strength = wp.mass * inv_dist_sq;
 
                 dir * strength * inv_dist
-            });
+            });*/
 
-            let accel = 50. * total_force / p.mass;
+            let total_force = accumulate_simd(&self.bh_quad, target);
 
-            let dt = (0.1 / accel.length().max(0.7)).min(0.5);
+            let accel = 50. * (total_force / p.mass);
+
+            let dt = (0.1 / accel.length().max(0.8)).min(0.2);
             p.pos += p.vel * dt + 0.5 * accel * dt * dt;
             p.vel += accel * dt;
         });
@@ -175,7 +253,7 @@ fn main() {
     let mut control = Control2D::new(0.5, 500.);
     let mut simulation = Simulation::new();
 
-    for _ in 0..100000 {
+    for _ in 0..50000 {
         let particle = Particle::new(
             rng.random_range(-3000.0..window_width) + window_width / 2.,
             rng.random_range(-3000.0..window_height) + window_height / 2.,
@@ -188,7 +266,7 @@ fn main() {
         ..Default::default()
     };
     let mut particle_mesh = Gm::new(
-        InstancedMesh::new(&context, &Instances::default(), &CpuMesh::circle(3)),
+        InstancedMesh::new(&context, &Instances::default(), &CpuMesh::circle(8)),
         ColorMaterial::new(&context, &particle_cpu_mat),
     );
 
@@ -252,7 +330,7 @@ fn main() {
         frame_input
             .screen()
             .clear(ClearState::color_and_depth(0., 0., 0., 1., 1.))
-            .render(&camera, std::iter::once(&mut particle_mesh), &[]);
+            .render(&camera, &mut particle_mesh.into_iter(), &[]);
 
         FrameOutput::default()
     });
