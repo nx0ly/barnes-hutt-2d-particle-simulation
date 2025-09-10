@@ -153,7 +153,7 @@ impl Simulation {
 
             let accel = 50. * total_force / p.mass;
 
-            let dt = (0.25 / accel.length().max(0.1)).min(0.5);
+            let dt = (0.1 / accel.length().max(0.7)).min(0.5);
             p.pos += p.vel * dt + 0.5 * accel * dt * dt;
             p.vel += accel * dt;
         });
@@ -175,7 +175,7 @@ fn main() {
     let mut control = Control2D::new(0.5, 500.);
     let mut simulation = Simulation::new();
 
-    for _ in 0..50000 {
+    for _ in 0..100000 {
         let particle = Particle::new(
             rng.random_range(-3000.0..window_width) + window_width / 2.,
             rng.random_range(-3000.0..window_height) + window_height / 2.,
